@@ -1,0 +1,338 @@
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Camera = Workspace.CurrentCamera
+local Replicated = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+-- Variables
+local LocalPlayer = Players.LocalPlayer
+local CircleRadius = 200
+local Gravity = 50
+local BulletSpeed = 2200
+local TargetPlayer = nil
+local RightMouseButtonHeld = false
+local DebugLineEnabled = true
+local AimingEnabled = true
+local hue = 0
+local PlayersList = {}
+local PredictionMultiplier = 1.12 -- Aumentado para melhor previsão
+local DropCompensation = 1.15 -- Aumentado para compensar a queda
+local SmoothAim = 0.9 -- Suavização do movimento (1 = instantâneo)
+local LastTargetPosition = Vector3.new(0, 0, 0)
+local LatencyCompensation = 0.025 -- Compensação de latência em segundos
+
+-- Cercle
+local Circle = Drawing.new("Circle")
+Circle.Visible = true
+Circle.Thickness = 2
+Circle.NumSides = 50
+Circle.Radius = CircleRadius
+Circle.Filled = false
+Circle.Transparency = 0.5
+
+-- Linha debug
+local DebugLine = Drawing.new("Line")
+DebugLine.Color = Color3.fromRGB(0, 255, 0)
+DebugLine.Thickness = 2
+DebugLine.Transparency = 0.8
+DebugLine.Visible = false
+
+-- Funções Aimbot
+local function getHeldItem(player)
+    local target = player:FindFirstChild("CurrentSelectedObject")
+    if target and target.Value and target.Value.Value then
+        return target.Value.Value.Name
+    end
+    return nil
+end
+
+local function getBulletSpeed(player)
+    local heldItemName = getHeldItem(player)
+    local bulletSpeed = 2250
+
+    if heldItemName then
+        local gunData = Replicated:WaitForChild("GunData")
+        local weapon = gunData:FindFirstChild(heldItemName)
+
+        if weapon and weapon:FindFirstChild("Stats") and weapon.Stats:FindFirstChild("BulletSettings") then
+            local bulletSpeedObj = weapon.Stats.BulletSettings:FindFirstChild("BulletSpeed")
+            if bulletSpeedObj then
+                bulletSpeed = bulletSpeedObj.Value
+            end
+        end
+    end
+
+    return bulletSpeed
+end
+
+local function updateCirclePosition()
+    local screenSize = Camera.ViewportSize
+    Circle.Position = Vector2.new(screenSize.X / 2, screenSize.Y / 2)
+end
+
+local function findNearestTargetToMouse()
+    local nearestTarget = nil
+    local shortestDistance = math.huge
+    for _, player in pairs(Players:GetPlayers()) do
+        if PlayersList[player.Name] and player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            local screenPoint = Camera:WorldToViewportPoint(player.Character.HumanoidRootPart.Position)
+            local mousePos = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+            local targetPos = Vector2.new(screenPoint.X, screenPoint.Y)
+            local distance = (targetPos - mousePos).Magnitude
+            if distance < CircleRadius and distance < shortestDistance then
+                shortestDistance = distance
+                nearestTarget = player
+            end
+        end
+    end
+    return nearestTarget
+end
+
+-- Função melhorada para prever posição futura com base na aceleração
+local function predictFuturePosition(pos, vel, speed, gravity)
+    local playerPos = Camera.CFrame.Position
+    local distance = (pos - playerPos).Magnitude
+    
+    -- Cálculo de tempo aprimorado com compensação de latência
+    local travelTime = (distance / speed) + LatencyCompensation
+    
+    -- Previsão de velocidade com compensação para aceleração
+    local accelCompensation = vel.Unit * vel.Magnitude * 0.1
+    local future = pos + (vel * travelTime * PredictionMultiplier) + accelCompensation
+    
+    -- Compensação de gravidade melhorada
+    local drop = Vector3.new(0, gravity * travelTime^2 * DropCompensation, 0)
+    
+    -- Compensando movimentos para cima/baixo
+    local verticalSpeed = vel.Y
+    local verticalCompensation = Vector3.new(0, verticalSpeed * travelTime * 0.3, 0)
+    
+    return future + drop + verticalCompensation
+end
+
+-- Função para suavizar a movimentação do mouse para o alvo
+local function smoothAimToPosition(targetPos)
+    local mouseX, mouseY = Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2
+    local moveX = (targetPos.X - mouseX) * SmoothAim
+    local moveY = (targetPos.Y - mouseY) * SmoothAim
+    mousemoverel(moveX, moveY)
+end
+
+local function aimAtTarget()
+    if not TargetPlayer or not TargetPlayer.Character then return end
+    
+    -- Priorizar ServerColliderHead, HumanoidRootPart ou Head
+    local part = TargetPlayer.Character:FindFirstChild("ServerColliderHead") or 
+                 TargetPlayer.Character:FindFirstChild("Head")
+    
+    if part then
+        -- Calcular a velocidade relativa com base na diferença de posição
+        local velocity = part.Velocity
+        
+        -- Se estivermos mirando no mesmo alvo, usar diferencial de posição
+        if TargetPlayer == TargetPlayer and LastTargetPosition ~= Vector3.new(0,0,0) then
+            local positionDelta = part.Position - LastTargetPosition
+            local timeFrame = RunService.RenderStepped:Wait() * 10
+            if timeFrame > 0 then
+                -- Adiciona um fator de velocidade calculado pela mudança de posição
+                velocity = velocity + (positionDelta / timeFrame)
+            end
+        end
+        
+        -- Atualizar última posição conhecida
+        LastTargetPosition = part.Position
+        
+        -- Prever posição futura
+        local future = predictFuturePosition(part.Position, velocity, BulletSpeed, Gravity)
+        
+        -- Converter para coordenadas de tela
+        local screenPoint = Camera:WorldToViewportPoint(future)
+        
+        -- Aplicar movimento suavizado
+        smoothAimToPosition(Vector2.new(screenPoint.X, screenPoint.Y))
+    end
+end
+
+local function updateDebugLine()
+    if not DebugLineEnabled then
+        DebugLine.Visible = false
+        return
+    end
+    local target = findNearestTargetToMouse()
+    if target and target.Character then
+        local part = target.Character:FindFirstChild("ServerColliderHead") or 
+                     target.Character:FindFirstChild("Head")
+        if part then
+            local future = predictFuturePosition(part.Position, part.Velocity or Vector3.new(), BulletSpeed, Gravity)
+            local point = Camera:WorldToViewportPoint(future)
+            DebugLine.From = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+            DebugLine.To = Vector2.new(point.X, point.Y)
+            DebugLine.Visible = true
+            return
+        end
+    end
+    DebugLine.Visible = false
+end
+
+-- ESP Config
+local config = {
+    ESPEnabled = true,
+    DistanceEnabled = true,
+    BoxEnabled = true,
+    NameEnabled = true,
+    RefreshRate = 0.1,
+    MaxDistance = 2400,
+    Colors = {
+        Box = Color3.fromRGB(255, 255, 255),
+        Distance = Color3.fromRGB(0, 255, 0),
+        Name = Color3.fromRGB(0, 0, 255),
+    }
+}
+
+-- ESP
+local ESPStorage = {}
+local function createESP(player)
+    if player == LocalPlayer then return end
+    local box = Drawing.new("Square")
+    box.Visible = false
+    box.Color = config.Colors.Box
+    box.Thickness = 2
+    box.Transparency = 1
+    box.Filled = false
+
+    local distance = Drawing.new("Text")
+    distance.Visible = false
+    distance.Size = 16
+    distance.Center = true
+    distance.Outline = true
+    distance.Color = config.Colors.Distance
+
+    local name = Drawing.new("Text")
+    name.Visible = false
+    name.Size = 16
+    name.Center = true
+    name.Outline = true
+    name.Color = config.Colors.Name
+    name.Text = player.Name
+
+    ESPStorage[player] = { Box = box, Distance = distance, Name = name }
+end
+
+local function removeESP(player)
+    local esp = ESPStorage[player]
+    if esp then
+        for _, obj in pairs(esp) do obj:Remove() end
+        ESPStorage[player] = nil
+    end
+end
+
+local function updateESP()
+    for _, player in pairs(Players:GetPlayers()) do
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if player ~= LocalPlayer and char and hrp then
+            local esp = ESPStorage[player]
+            if not esp then createESP(player) esp = ESPStorage[player] end
+
+            local pos, onScreen = Camera:WorldToViewportPoint(hrp.Position + Vector3.new(0, 2.5, 0))
+            local dist = (Camera.CFrame.Position - hrp.Position).Magnitude
+            if onScreen and dist <= config.MaxDistance then
+                local scale = 1 / (pos.Z * math.tan(math.rad(Camera.FieldOfView * 0.5)) * 2) * 1000
+                local w, h = math.floor(4.5 * scale), math.floor(6 * scale)
+                local x, y = math.floor(pos.X), math.floor(pos.Y)
+                local xPos, yPos = x - w // 2, y - h // 2
+
+                if config.BoxEnabled then
+                    esp.Box.Size = Vector2.new(w, h)
+                    esp.Box.Position = Vector2.new(xPos, yPos)
+                    esp.Box.Visible = true
+                else esp.Box.Visible = false end
+
+                if config.DistanceEnabled then
+                    esp.Distance.Text = string.format("[ %dm ]", math.floor(dist))
+                    esp.Distance.Position = Vector2.new(x, yPos + h + 14)
+                    esp.Distance.Visible = true
+                else esp.Distance.Visible = false end
+
+                if config.NameEnabled then
+                    esp.Name.Text = player.Name
+                    esp.Name.Position = Vector2.new(x, yPos - 18)
+                    esp.Name.Visible = true
+                else esp.Name.Visible = false end
+            else
+                esp.Box.Visible = false
+                esp.Distance.Visible = false
+                if esp.Name then esp.Name.Visible = false end
+            end
+        elseif ESPStorage[player] then
+            removeESP(player)
+        end
+    end
+end
+
+-- Conexões
+UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed then
+        if input.KeyCode == Enum.KeyCode.F then
+            AimingEnabled = not AimingEnabled
+            print(AimingEnabled and "Aiming enabled" or "Aiming disabled")
+        elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+            RightMouseButtonHeld = true
+            -- Resetar a última posição conhecida ao começar a mirar
+            LastTargetPosition = Vector3.new(0, 0, 0)
+        elseif input.KeyCode == Enum.KeyCode.D then
+            DebugLineEnabled = not DebugLineEnabled
+        elseif input.KeyCode == Enum.KeyCode.Q then
+            -- Tecla para ajustar velocidade de suavização (mais rápido)
+            SmoothAim = math.min(SmoothAim + 0.05, 1)
+            print("Smooth aim: " .. SmoothAim)
+        elseif input.KeyCode == Enum.KeyCode.E then
+            -- Tecla para ajustar velocidade de suavização (mais lento)
+            SmoothAim = math.max(SmoothAim - 0.05, 0.5)
+            print("Smooth aim: " .. SmoothAim)
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        RightMouseButtonHeld = false
+        -- Resetar a última posição conhecida ao parar de mirar
+        LastTargetPosition = Vector3.new(0, 0, 0)
+    end
+end)
+
+Players.PlayerAdded:Connect(function(player)
+    PlayersList[player.Name] = true
+    createESP(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    PlayersList[player.Name] = nil
+    removeESP(player)
+end)
+
+for _, player in pairs(Players:GetPlayers()) do
+    PlayersList[player.Name] = true
+    createESP(player)
+end
+
+-- Render loop
+RunService.RenderStepped:Connect(function()
+    hue = (hue + 1) % 360
+    Circle.Color = Color3.fromHSV(hue / 360, 1, 1)
+    updateCirclePosition()
+    BulletSpeed = getBulletSpeed(LocalPlayer)
+    updateDebugLine()
+
+    if RightMouseButtonHeld and AimingEnabled then
+        TargetPlayer = findNearestTargetToMouse()
+        aimAtTarget()
+    end
+
+    if config.ESPEnabled then
+        updateESP()
+    end
+end)
